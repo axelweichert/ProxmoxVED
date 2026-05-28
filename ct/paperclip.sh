@@ -4,6 +4,16 @@ source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxV
 # Author: Fabian Pulch (fpulch)
 # License: MIT | https://github.com/community-scripts/ProxmoxVED/raw/main/LICENSE
 # Source: https://github.com/paperclipai/paperclip
+#
+# PATCHED VERSION
+# Fixes:
+#   1. app name was "paperclip-ai" causing fetch_and_deploy_gh_release to
+#      extract into /opt/paperclip-ai while all other code expects /opt/paperclip.
+#   2. var_unprivileged=0 (privileged) so embedded-postgres' initdb works.
+#      Paperclip's db:migrate spins up its own embedded PostgreSQL via
+#      @embedded-postgres/linux-x64, which requires running initdb as the
+#      "postgres" system user. In unprivileged LXCs the UID mapping breaks
+#      that drop-privileges step and initdb exits 1.
 
 APP="Paperclip"
 var_tags="${var_tags:-ai;automation;dev-tools}"
@@ -13,7 +23,7 @@ var_disk="${var_disk:-20}"
 var_os="${var_os:-debian}"
 var_version="${var_version:-13}"
 var_arm64="${var_arm64:-no}"
-var_unprivileged="${var_unprivileged:-1}"
+var_unprivileged="${var_unprivileged:-0}"   # CHANGED: privileged container
 
 header_info "$APP"
 variables
@@ -30,7 +40,7 @@ function update_script() {
     exit
   fi
 
-  if check_for_gh_release "paperclip-ai" "paperclipai/paperclip"; then
+  if check_for_gh_release "paperclip" "paperclipai/paperclip"; then
     msg_info "Stopping Service"
     systemctl stop paperclip
     msg_ok "Stopped Service"
@@ -39,7 +49,7 @@ function update_script() {
     cp /opt/paperclip/.env /opt/paperclip.env.bak
     msg_ok "Backed up Configuration"
 
-    CLEAN_INSTALL=1 fetch_and_deploy_gh_release "paperclip-ai" "paperclipai/paperclip" "tarball"
+    CLEAN_INSTALL=1 fetch_and_deploy_gh_release "paperclip" "paperclipai/paperclip" "tarball"
 
     msg_info "Restoring Configuration"
     mv /opt/paperclip.env.bak /opt/paperclip/.env
