@@ -4,6 +4,20 @@
 # Author: Fabian Pulch (fpulch)
 # License: MIT | https://github.com/community-scripts/ProxmoxVED/raw/main/LICENSE
 # Source: https://github.com/paperclipai/paperclip
+#
+# PATCHED VERSION
+# Changes vs upstream:
+#   1. fetch_and_deploy_gh_release is called with app name "paperclip" (not
+#      "paperclip-ai") so it extracts into /opt/paperclip, matching everything
+#      else in this script.
+#   2. System PostgreSQL 17 setup REMOVED. Paperclip uses its own embedded
+#      PostgreSQL (@embedded-postgres/linux-x64) and never connects to the
+#      system instance. The system Postgres was dead weight and never used.
+#   3. DATABASE_URL line removed from .env — Paperclip manages its own DB
+#      under $PAPERCLIP_HOME/instances/default/db.
+#   4. Ensure the "postgres" system user exists before running migrations,
+#      since embedded-postgres' initdb requires it to drop privileges.
+#   5. PAPERCLIP_HOME owned by postgres so initdb can write into it.
 
 source /dev/stdin <<<"$FUNCTIONS_FILE_PATH"
 color
@@ -18,14 +32,20 @@ $STD apt install -y \
   build-essential \
   git \
   python3 \
-  ripgrep
+  ripgrep \
+  passwd
 msg_ok "Installed Dependencies"
 
 NODE_VERSION="24" NODE_MODULE="pnpm" setup_nodejs
-PG_VERSION="17" setup_postgresql
-PG_DB_NAME="paperclip" PG_DB_USER="paperclip" setup_postgresql_db
 
-fetch_and_deploy_gh_release "paperclip-ai" "paperclipai/paperclip" "tarball"
+msg_info "Creating postgres system user (for embedded PostgreSQL)"
+if ! id postgres >/dev/null 2>&1; then
+  $STD adduser --system --group --home /var/lib/postgresql --shell /bin/bash postgres
+fi
+msg_ok "Created postgres system user"
+
+# NOTE: app name MUST be "paperclip" so target dir becomes /opt/paperclip
+fetch_and_deploy_gh_release "paperclip" "paperclipai/paperclip" "tarball"
 
 msg_info "Building Paperclip"
 cd /opt/paperclip
@@ -44,10 +64,11 @@ msg_ok "Installed Agent CLIs"
 
 msg_info "Configuring Paperclip"
 mkdir -p /opt/paperclip-data
+chown -R postgres:postgres /opt/paperclip-data
+chmod 750 /opt/paperclip-data
 mkdir -p /root/.claude /root/.codex
 BETTER_AUTH_SECRET=$(openssl rand -hex 32)
 cat <<EOF >/opt/paperclip/.env
-DATABASE_URL=postgresql://${PG_DB_USER}:${PG_DB_PASS}@127.0.0.1:5432/${PG_DB_NAME}
 HOST=0.0.0.0
 PORT=3100
 SERVE_UI=true
@@ -62,6 +83,8 @@ msg_ok "Configured Paperclip"
 
 msg_info "Running Database Migrations"
 set -a && source /opt/paperclip/.env && set +a
+# embedded-postgres needs a writable home for the postgres user
+chown -R postgres:postgres /opt/paperclip-data
 $STD pnpm db:migrate
 msg_ok "Ran Database Migrations"
 
@@ -69,34 +92,38 @@ msg_info "Bootstrapping Paperclip"
 PAPERCLIP_ONBOARD_LOG=/opt/paperclip/paperclip-onboard.log
 PAPERCLIP_BOOTSTRAP_LOG=/opt/paperclip/paperclip-bootstrap.log
 
-for PAPERCLIP_ONBOARD_CMD in \
-  "pnpm paperclipai onboard --yes --bind lan" \
-  "pnpm paperclipai onboard --yes"; do
-  rm -f "$PAPERCLIP_ONBOARD_LOG"
-  setsid bash -c "cd /opt/paperclip && ${PAPERCLIP_ONBOARD_CMD}" >"$PAPERCLIP_ONBOARD_LOG" 2>&1 &
-  PAPERCLIP_ONBOARD_PID=$!
-  for _ in {1..60}; do
-    if [[ -f /opt/paperclip-data/instances/default/config.json ]]; then
+# Idempotency: if a previous run already produced the config, skip onboarding.
+if [[ ! -f /opt/paperclip-data/instances/default/config.json ]]; then
+  for PAPERCLIP_ONBOARD_CMD in \
+    "pnpm paperclipai onboard --yes --bind lan" \
+    "pnpm paperclipai onboard --yes"; do
+    rm -f "$PAPERCLIP_ONBOARD_LOG"
+    setsid bash -c "cd /opt/paperclip && ${PAPERCLIP_ONBOARD_CMD}" >"$PAPERCLIP_ONBOARD_LOG" 2>&1 &
+    PAPERCLIP_ONBOARD_PID=$!
+    for _ in {1..60}; do
+      if [[ -f /opt/paperclip-data/instances/default/config.json ]]; then
+        break
+      fi
+      if ! kill -0 "$PAPERCLIP_ONBOARD_PID" 2>/dev/null; then
+        break
+      fi
+      sleep 2
+    done
+    if kill -0 "$PAPERCLIP_ONBOARD_PID" 2>/dev/null; then
+      kill -- -"${PAPERCLIP_ONBOARD_PID}" >/dev/null 2>&1 || true
+      wait "$PAPERCLIP_ONBOARD_PID" 2>/dev/null || true
+    fi
+    [[ -f /opt/paperclip-data/instances/default/config.json ]] && break
+    if ! grep -q "unknown option '--bind'" "$PAPERCLIP_ONBOARD_LOG"; then
       break
     fi
-    if ! kill -0 "$PAPERCLIP_ONBOARD_PID" 2>/dev/null; then
-      break
-    fi
-    sleep 2
+    msg_info "Retrying Paperclip Onboarding"
   done
-  if kill -0 "$PAPERCLIP_ONBOARD_PID" 2>/dev/null; then
-    kill -- -"${PAPERCLIP_ONBOARD_PID}" >/dev/null 2>&1 || true
-    wait "$PAPERCLIP_ONBOARD_PID" 2>/dev/null || true
-  fi
-  [[ -f /opt/paperclip-data/instances/default/config.json ]] && break
-  if ! grep -q "unknown option '--bind'" "$PAPERCLIP_ONBOARD_LOG"; then
-    break
-  fi
-  msg_info "Retrying Paperclip Onboarding"
-done
+fi
 
 if [[ ! -f /opt/paperclip-data/instances/default/config.json ]]; then
   msg_error "Failed to bootstrap Paperclip"
+  msg_error "Check /opt/paperclip/paperclip-onboard.log for details"
   exit 1
 fi
 
@@ -128,8 +155,7 @@ msg_info "Creating Service"
 cat <<EOF >/etc/systemd/system/paperclip.service
 [Unit]
 Description=Paperclip
-After=network.target postgresql.service
-Requires=postgresql.service
+After=network.target
 
 [Service]
 Type=simple
